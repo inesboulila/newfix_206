@@ -28,7 +28,7 @@ st.set_page_config(
 # ── Load model bundle ─────────────────────────────────────────
 @st.cache_resource
 def load_model():
-    with open('lgbm_mirna_model.pkl', 'rb') as f:
+    with open('lgbm_mirna_model_fixed.pkl', 'rb') as f:
         return pickle.load(f)
 
 @st.cache_data
