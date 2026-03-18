@@ -1,12 +1,12 @@
 """
 miRNA Upregulation Predictor
 =============================
-Model : lgbm_mirna_model.pkl  (LightGBM + TargetEncoder + isotonic calibration)
+Model : lgbm_mirna_model.pkl  (LightGBM + TargetEncoder pipeline)
 Run   : streamlit run app.py
 
-Prediction flow:
-  1. Encode input with pipe (encoder step)
-  2. Predict with calibrated_model (calibrated probabilities)
+Features expected by the model (in order):
+  CAT: parasite, organism, cell type, seed_family, parasite_celltype
+  NUM: time, is_conserved
 """
 
 import streamlit as st
@@ -25,7 +25,7 @@ st.set_page_config(
 # ── Load model bundle ─────────────────────────────────────────
 @st.cache_resource
 def load_model():
-    with open('lgbm_mirna_model_fixed.pkl', 'rb') as f:
+    with open('lgbm_mirna_model.pkl', 'rb') as f:
         return pickle.load(f)
 
 @st.cache_data
@@ -65,13 +65,11 @@ def lookup_family(mirna_name: str, lookup: dict):
 
 # ── Load resources ────────────────────────────────────────────
 try:
-    bundle           = load_model()
-    pipe             = bundle['model']            # encoder + lgbm pipeline
-    calibrated_model = bundle['calibrated_model'] # calibrated lgbm for probabilities
-    encoder          = bundle['encoder']          # for encoding input before prediction
-    metrics          = bundle['metrics']
-    options          = bundle['options']
-    lookup           = load_targetscan()
+    bundle  = load_model()
+    model   = bundle['model']
+    metrics = bundle['metrics']
+    options = bundle['options']
+    lookup  = load_targetscan()
 except FileNotFoundError:
     st.error(
         "**Missing file:** `lgbm_mirna_model.pkl` not found. "
@@ -153,9 +151,10 @@ with col_result:
                     "features (parasite, organism, cell type, time)."
                 )
 
-            # ── Step 2: build input row ───────────────────────
-            # parasite and cell type passed exactly as selectbox returns them
-            # — no lowercasing — so TargetEncoder sees the same values as training
+            # ── Step 2: build the 7-column input row ──────────
+            # parasite and cell type are passed exactly as they come from
+            # the selectbox — no lowercasing or stripping — so TargetEncoder
+            # sees the same values it was trained on (e.g. "L.major" not "l.major")
             parasite_celltype = f"{parasite}_{cell_type}"
 
             input_df = pd.DataFrame([{
@@ -168,14 +167,10 @@ with col_result:
                 'is_conserved':      is_conserved,
             }])
 
-            # ── Step 3: encode then predict with calibrated model ──
+            # ── Step 3: predict ───────────────────────────────
             try:
-                # Encode using the trained encoder
-                input_enc = encoder.transform(input_df)
-
-                # Predict using calibrated model — gives realistic probabilities
-                proba     = calibrated_model.predict_proba(input_enc)[0]
-                pred      = calibrated_model.predict(input_enc)[0]
+                proba     = model.predict_proba(input_df)[0]
+                pred      = model.predict(input_df)[0]
                 prob_up   = proba[1]
                 prob_down = proba[0]
 
@@ -217,8 +212,7 @@ with col_result:
 st.divider()
 st.subheader("Model performance")
 st.caption(
-    f"LightGBM + isotonic calibration · "
-    f"{metrics['n_train']} training samples · "
+    f"LightGBM trained on {metrics['n_train']} samples · "
     f"5-fold cross-validation · "
     f"206 rows total (68 non-conserved miRNAs use NaN for seed_family)"
 )
