@@ -7,11 +7,6 @@ Run   : streamlit run app.py
 Features expected by the model (in order):
   CAT: parasite, organism, cell type, seed_family, parasite_celltype
   NUM: time, is_conserved
-
-At prediction time:
-  1. If miRNA name is found in training data → show its exact observed behaviour
-  2. If miRNA is unseen → fall back to seed family stats from TargetScan
-  3. Model prediction runs normally either way — the lookup is informational context
 """
 
 import streamlit as st
@@ -30,12 +25,12 @@ st.set_page_config(
 # ── Load model bundle ─────────────────────────────────────────
 @st.cache_resource
 def load_model():
-    with open('lgbm_mirna_model_fixed.pkl', 'rb') as f:
+    with open('lgbm_mirna_model.pkl', 'rb') as f:
         return pickle.load(f)
 
 @st.cache_data
 def load_targetscan():
-    """Load TargetScan miR_Family_Info.txt and build miRNA → family lookup."""
+    """Load TargetScan miR_Family_Info.txt and build lookup."""
     try:
         ts = pd.read_csv('miR_Family_Info.txt', sep='\t', dtype=str)
         ts.columns = [c.strip() for c in ts.columns]
@@ -52,8 +47,7 @@ def load_targetscan():
     except FileNotFoundError:
         return {}
 
-def lookup_family_from_targetscan(mirna_name: str, ts_lookup: dict):
-    """Normalize miRNA name and look up its seed family from TargetScan."""
+def lookup_family(mirna_name: str, lookup: dict):
     def normalize(name):
         name = str(name).strip().lower()
         name = re.sub(r'^[a-z]{3}-', '', name)
@@ -61,23 +55,21 @@ def lookup_family_from_targetscan(mirna_name: str, ts_lookup: dict):
         return name
 
     norm = normalize(mirna_name)
-    if norm in ts_lookup:
-        return ts_lookup[norm]
+    if norm in lookup:
+        return lookup[norm]
     norm2 = re.sub(r'-[12]$', '', norm)
-    if norm2 in ts_lookup:
-        return ts_lookup[norm2]
+    if norm2 in lookup:
+        return lookup[norm2]
     return None
 
 
 # ── Load resources ────────────────────────────────────────────
 try:
-    bundle        = load_model()
-    model         = bundle['model']
-    metrics       = bundle['metrics']
-    options       = bundle['options']
-    mirna_lookup  = bundle.get('mirna_lookup', {})    # miRNA  → stats from training data
-    family_lookup = bundle.get('family_lookup', {})   # family → stats from training data
-    ts_lookup     = load_targetscan()
+    bundle  = load_model()
+    model   = bundle['model']
+    metrics = bundle['metrics']
+    options = bundle['options']
+    lookup  = load_targetscan()
 except FileNotFoundError:
     st.error(
         "**Missing file:** `lgbm_mirna_model.pkl` not found. "
@@ -109,8 +101,8 @@ with col_input:
 
     mirna_input = st.text_input(
         "miRNA name",
-        placeholder="e.g. hsa-miR-146b, mmu-let-7f",
-        help="Enter the miRBase ID. Known miRNAs are checked against training data first."
+        placeholder="e.g. hsa-miR-155-5p, mmu-let-7f",
+        help="Enter the miRBase ID. The seed family is looked up automatically."
     )
 
     parasite = st.selectbox(
@@ -146,87 +138,29 @@ with col_result:
         if not mirna_input.strip():
             st.warning("Please enter a miRNA name.")
         else:
-            mirna_clean = mirna_input.strip()
+            # ── Step 1: look up seed family ───────────────────
+            family       = lookup_family(mirna_input.strip(), lookup)
+            is_conserved = 1 if family else 0
 
-            # ── Step 1: check miRNA against training data ─────
-            mirna_stats  = mirna_lookup.get(mirna_clean)
-            family       = None
-            family_stats = None
-            is_conserved = 0
-
-            if mirna_stats:
-                # miRNA is known — use its exact observed behaviour
-                family       = mirna_stats.get('seed_family')
-                is_conserved = 1 if pd.notna(family) else 0
-
-                n      = mirna_stats['n']
-                pct_up = mirna_stats['pct_up']
-
-                if mirna_stats['always_up']:
-                    st.success(
-                        f"✅ **{mirna_clean}** is in the training data — "
-                        f"always **upregulated** across all {n} observation(s)."
-                    )
-                elif mirna_stats['always_down']:
-                    st.error(
-                        f"✅ **{mirna_clean}** is in the training data — "
-                        f"always **downregulated** across all {n} observation(s)."
-                    )
-                else:
-                    st.warning(
-                        f"⚠️ **{mirna_clean}** is in the training data but shows "
-                        f"**mixed behaviour**: upregulated {pct_up*100:.0f}% of the time "
-                        f"across {n} observations. The model prediction depends on the "
-                        f"specific conditions you selected."
-                    )
-
+            if family:
+                st.info(f"Seed family found: **{family}**")
             else:
-                # miRNA is unseen — fall back to seed family
-                st.info(
-                    f"**{mirna_clean}** is not in the training data. "
-                    f"Looking up its seed family for context..."
+                st.warning(
+                    f"**{mirna_input}** is not in the broadly conserved "
+                    "TargetScan families. Prediction will rely on the other "
+                    "features (parasite, organism, cell type, time)."
                 )
-                family = lookup_family_from_targetscan(mirna_clean, ts_lookup)
-                is_conserved = 1 if family else 0
 
-                if family:
-                    family_stats = family_lookup.get(family)
-                    if family_stats:
-                        n      = family_stats['n']
-                        pct_up = family_stats['pct_up']
-                        if family_stats['always_up']:
-                            st.info(
-                                f"Seed family **{family}** found — "
-                                f"always upregulated across {n} observations in training data."
-                            )
-                        elif family_stats['always_down']:
-                            st.info(
-                                f"Seed family **{family}** found — "
-                                f"always downregulated across {n} observations in training data."
-                            )
-                        else:
-                            st.warning(
-                                f"Seed family **{family}** found but is **mixed**: "
-                                f"upregulated {pct_up*100:.0f}% of the time across {n} observations. "
-                                f"Prediction uncertainty is higher."
-                            )
-                    else:
-                        st.info(f"Seed family **{family}** found via TargetScan.")
-                else:
-                    st.warning(
-                        f"**{mirna_clean}** not found in training data or TargetScan. "
-                        "Prediction relies on parasite, organism, cell type, and time only."
-                    )
-
-            # ── Step 2: build input row (unchanged from original) ──
-            para_clean        = parasite.lower().replace(' ', '')
-            cell_clean        = cell_type.lower().strip()
-            parasite_celltype = f"{para_clean}_{cell_clean}"
+            # ── Step 2: build the 7-column input row ──────────
+            # parasite and cell type are passed exactly as they come from
+            # the selectbox — no lowercasing or stripping — so TargetEncoder
+            # sees the same values it was trained on (e.g. "L.major" not "l.major")
+            parasite_celltype = f"{parasite}_{cell_type}"
 
             input_df = pd.DataFrame([{
-                'parasite':          para_clean,
+                'parasite':          parasite,
                 'organism':          organism,
-                'cell type':         cell_clean,
+                'cell type':         cell_type,
                 'seed_family':       family if family else np.nan,
                 'parasite_celltype': parasite_celltype,
                 'time':              time,
@@ -240,25 +174,10 @@ with col_result:
                 prob_up   = proba[1]
                 prob_down = proba[0]
 
-                st.divider()
-
                 if pred == 1:
                     st.success("## ⬆ Upregulated")
                 else:
                     st.error("## ⬇ Downregulated")
-
-                # If miRNA behaviour in training data contradicts the model prediction, warn
-                if mirna_stats:
-                    if mirna_stats['always_up'] and pred == 0:
-                        st.warning(
-                            "⚠️ Note: this miRNA is always upregulated in training data, "
-                            "but the model predicts downregulation for these specific conditions."
-                        )
-                    elif mirna_stats['always_down'] and pred == 1:
-                        st.warning(
-                            "⚠️ Note: this miRNA is always downregulated in training data, "
-                            "but the model predicts upregulation for these specific conditions."
-                        )
 
                 st.markdown(f"**Confidence:** {max(prob_up, prob_down)*100:.1f}%")
 
@@ -273,9 +192,7 @@ with col_result:
                 )
 
                 with st.expander("Input summary"):
-                    display_df = input_df.copy()
-                    display_df.insert(0, 'miRNA', mirna_clean)
-                    st.dataframe(display_df, use_container_width=True, hide_index=True)
+                    st.dataframe(input_df, use_container_width=True, hide_index=True)
 
             except Exception as e:
                 st.error(f"**Prediction error:** {e}")
@@ -310,7 +227,7 @@ fold_cols = st.columns(len(metrics['auc_folds']))
 for col, (i, auc_val) in zip(fold_cols, enumerate(metrics['auc_folds'])):
     col.metric(f"Fold {i+1}", f"{auc_val:.3f}")
 
-st.markdown("**Permutation feature importance** (avg AUC drop on held-out folds):")
+st.markdown("**Permutation feature importance** (how much AUC drops when each feature is shuffled):")
 fi = pd.DataFrame(metrics['feature_importance'])
 fi['importance'] = fi['importance'].round(4)
 fi['std']        = fi['std'].round(4)
