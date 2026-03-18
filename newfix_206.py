@@ -5,11 +5,13 @@ Model : lgbm_mirna_model.pkl  (LightGBM + TargetEncoder pipeline)
 Run   : streamlit run app.py
 
 Features expected by the model (in order):
-  CAT: parasite, organism, cell type, parasite_celltype
-  NUM: time, is_conserved, seed_family_pct_up, seed_family_entropy, seed_family_n
+  CAT: parasite, organism, cell type, seed_family, parasite_celltype
+  NUM: time, is_conserved
 
-Note: seed_family is looked up from TargetScan to compute the 3 variance
-features, but is NOT passed directly to the model as a categorical.
+At prediction time:
+  1. If miRNA name is found in training data → show its exact observed behaviour
+  2. If miRNA is unseen → fall back to seed family stats from TargetScan
+  3. Model prediction runs normally either way — the lookup is informational context
 """
 
 import streamlit as st
@@ -50,8 +52,8 @@ def load_targetscan():
     except FileNotFoundError:
         return {}
 
-def lookup_family(mirna_name: str, lookup: dict):
-    """Try to find the seed family for a given miRNA name."""
+def lookup_family_from_targetscan(mirna_name: str, ts_lookup: dict):
+    """Normalize miRNA name and look up its seed family from TargetScan."""
     def normalize(name):
         name = str(name).strip().lower()
         name = re.sub(r'^[a-z]{3}-', '', name)
@@ -59,26 +61,12 @@ def lookup_family(mirna_name: str, lookup: dict):
         return name
 
     norm = normalize(mirna_name)
-    if norm in lookup:
-        return lookup[norm]
+    if norm in ts_lookup:
+        return ts_lookup[norm]
     norm2 = re.sub(r'-[12]$', '', norm)
-    if norm2 in lookup:
-        return lookup[norm2]
+    if norm2 in ts_lookup:
+        return ts_lookup[norm2]
     return None
-
-def get_family_variance_features(family, family_stats):
-    """
-    Look up the 3 variance features for a seed family from the bundle.
-    If family is unknown: pct_up=0.5 (no info), entropy=1.0 (max uncertainty), n=0.
-    """
-    if family and family in family_stats:
-        stats = family_stats[family]
-        return (
-            stats['seed_family_pct_up'],
-            stats['seed_family_entropy'],
-            stats['seed_family_n'],
-        )
-    return (0.5, 1.0, 0)
 
 
 # ── Load resources ────────────────────────────────────────────
@@ -87,19 +75,15 @@ try:
     model         = bundle['model']
     metrics       = bundle['metrics']
     options       = bundle['options']
-    family_stats  = bundle.get('family_stats', {})
-    feature_names = bundle.get('feature_names', [])
-    lookup        = load_targetscan()
+    mirna_lookup  = bundle.get('mirna_lookup', {})    # miRNA  → stats from training data
+    family_lookup = bundle.get('family_lookup', {})   # family → stats from training data
+    ts_lookup     = load_targetscan()
 except FileNotFoundError:
     st.error(
         "**Missing file:** `lgbm_mirna_model.pkl` not found. "
         "Run the training script first and place the pkl here."
     )
     st.stop()
-
-# Detect model version from saved feature names
-IS_V5 = 'seed_family_pct_up' in feature_names
-IS_V4 = 'seed_family' in (bundle.get('cat_cols') or [])
 
 
 # ══════════════════════════════════════════════════════════════
@@ -110,11 +94,6 @@ st.markdown(
     "Predicts whether a miRNA is **upregulated** or **downregulated** "
     "during *Leishmania* infection based on experimental conditions."
 )
-if IS_V5:
-    st.caption(
-        "Model v5 · seed family signal encoded via variance features "
-        "(pct_up, entropy, n) · no redundancy with TargetEncoder"
-    )
 st.divider()
 
 
@@ -130,8 +109,8 @@ with col_input:
 
     mirna_input = st.text_input(
         "miRNA name",
-        placeholder="e.g. hsa-miR-155-5p, mmu-let-7f",
-        help="Enter the miRBase ID. The seed family is looked up automatically from TargetScan."
+        placeholder="e.g. hsa-miR-146b, mmu-let-7f",
+        help="Enter the miRBase ID. Known miRNAs are checked against training data first."
     )
 
     parasite = st.selectbox(
@@ -167,64 +146,92 @@ with col_result:
         if not mirna_input.strip():
             st.warning("Please enter a miRNA name.")
         else:
-            # ── Step 1: look up seed family from TargetScan ───
-            family       = lookup_family(mirna_input.strip(), lookup)
-            is_conserved = 1 if family else 0
+            mirna_clean = mirna_input.strip()
 
-            if family:
-                st.info(f"Seed family found: **{family}**")
+            # ── Step 1: check miRNA against training data ─────
+            mirna_stats  = mirna_lookup.get(mirna_clean)
+            family       = None
+            family_stats = None
+            is_conserved = 0
 
-                # Show variance stats so user understands prediction confidence
-                if IS_V5 and family in family_stats:
-                    pct_up  = family_stats[family]['seed_family_pct_up']
-                    entropy = family_stats[family]['seed_family_entropy']
-                    n       = int(family_stats[family]['seed_family_n'])
-                    mix_label = (
-                        "⚠️ highly mixed — direction varies across conditions"
-                        if entropy > 0.8 else
-                        "✅ consistent — usually same direction"
+            if mirna_stats:
+                # miRNA is known — use its exact observed behaviour
+                family       = mirna_stats.get('seed_family')
+                is_conserved = 1 if pd.notna(family) else 0
+
+                n      = mirna_stats['n']
+                pct_up = mirna_stats['pct_up']
+
+                if mirna_stats['always_up']:
+                    st.success(
+                        f"✅ **{mirna_clean}** is in the training data — "
+                        f"always **upregulated** across all {n} observation(s)."
                     )
-                    st.caption(
-                        f"Family behaviour in training data: "
-                        f"**{pct_up*100:.0f}% upregulated** across {n} observations · "
-                        f"entropy {entropy:.2f} · {mix_label}"
+                elif mirna_stats['always_down']:
+                    st.error(
+                        f"✅ **{mirna_clean}** is in the training data — "
+                        f"always **downregulated** across all {n} observation(s)."
                     )
+                else:
+                    st.warning(
+                        f"⚠️ **{mirna_clean}** is in the training data but shows "
+                        f"**mixed behaviour**: upregulated {pct_up*100:.0f}% of the time "
+                        f"across {n} observations. The model prediction depends on the "
+                        f"specific conditions you selected."
+                    )
+
             else:
-                st.warning(
-                    f"**{mirna_input}** seed family not found in TargetScan broadly "
-                    "conserved families. Prediction relies on parasite, organism, "
-                    "cell type, and time only."
+                # miRNA is unseen — fall back to seed family
+                st.info(
+                    f"**{mirna_clean}** is not in the training data. "
+                    f"Looking up its seed family for context..."
                 )
+                family = lookup_family_from_targetscan(mirna_clean, ts_lookup)
+                is_conserved = 1 if family else 0
 
-            # ── Step 2: build input row ───────────────────────
+                if family:
+                    family_stats = family_lookup.get(family)
+                    if family_stats:
+                        n      = family_stats['n']
+                        pct_up = family_stats['pct_up']
+                        if family_stats['always_up']:
+                            st.info(
+                                f"Seed family **{family}** found — "
+                                f"always upregulated across {n} observations in training data."
+                            )
+                        elif family_stats['always_down']:
+                            st.info(
+                                f"Seed family **{family}** found — "
+                                f"always downregulated across {n} observations in training data."
+                            )
+                        else:
+                            st.warning(
+                                f"Seed family **{family}** found but is **mixed**: "
+                                f"upregulated {pct_up*100:.0f}% of the time across {n} observations. "
+                                f"Prediction uncertainty is higher."
+                            )
+                    else:
+                        st.info(f"Seed family **{family}** found via TargetScan.")
+                else:
+                    st.warning(
+                        f"**{mirna_clean}** not found in training data or TargetScan. "
+                        "Prediction relies on parasite, organism, cell type, and time only."
+                    )
+
+            # ── Step 2: build input row (unchanged from original) ──
             para_clean        = parasite.lower().replace(' ', '')
             cell_clean        = cell_type.lower().strip()
             parasite_celltype = f"{para_clean}_{cell_clean}"
 
-            # Get variance features (or neutral defaults if family unknown)
-            pct_up, entropy, n = get_family_variance_features(family, family_stats)
-
-            # v5 row — seed_family NOT included, only variance features represent family
-            row = {
-                'parasite':            para_clean,
-                'organism':            organism,
-                'cell type':           cell_clean,
-                'parasite_celltype':   parasite_celltype,
-                'time':                time,
-                'is_conserved':        is_conserved,
-                'seed_family_pct_up':  pct_up,
-                'seed_family_entropy': entropy,
-                'seed_family_n':       n,
-            }
-
-            # v4 fallback: old model expects seed_family as a raw categorical
-            if IS_V4:
-                row['seed_family'] = family if family else np.nan
-
-            input_df = pd.DataFrame([row])
-
-            # Reorder columns to match training order exactly
-            input_df = input_df.reindex(columns=feature_names)
+            input_df = pd.DataFrame([{
+                'parasite':          para_clean,
+                'organism':          organism,
+                'cell type':         cell_clean,
+                'seed_family':       family if family else np.nan,
+                'parasite_celltype': parasite_celltype,
+                'time':              time,
+                'is_conserved':      is_conserved,
+            }])
 
             # ── Step 3: predict ───────────────────────────────
             try:
@@ -233,10 +240,25 @@ with col_result:
                 prob_up   = proba[1]
                 prob_down = proba[0]
 
+                st.divider()
+
                 if pred == 1:
                     st.success("## ⬆ Upregulated")
                 else:
                     st.error("## ⬇ Downregulated")
+
+                # If miRNA behaviour in training data contradicts the model prediction, warn
+                if mirna_stats:
+                    if mirna_stats['always_up'] and pred == 0:
+                        st.warning(
+                            "⚠️ Note: this miRNA is always upregulated in training data, "
+                            "but the model predicts downregulation for these specific conditions."
+                        )
+                    elif mirna_stats['always_down'] and pred == 1:
+                        st.warning(
+                            "⚠️ Note: this miRNA is always downregulated in training data, "
+                            "but the model predicts upregulation for these specific conditions."
+                        )
 
                 st.markdown(f"**Confidence:** {max(prob_up, prob_down)*100:.1f}%")
 
@@ -252,8 +274,7 @@ with col_result:
 
                 with st.expander("Input summary"):
                     display_df = input_df.copy()
-                    display_df.insert(0, 'miRNA', mirna_input.strip())
-                    display_df.insert(1, 'seed_family_looked_up', family if family else 'not found')
+                    display_df.insert(0, 'miRNA', mirna_clean)
                     st.dataframe(display_df, use_container_width=True, hide_index=True)
 
             except Exception as e:
@@ -274,8 +295,9 @@ with col_result:
 st.divider()
 st.subheader("Model performance")
 st.caption(
-    f"LightGBM · {metrics['n_train']} training samples · "
-    f"5-fold stratified cross-validation"
+    f"LightGBM trained on {metrics['n_train']} samples · "
+    f"5-fold cross-validation · "
+    f"206 rows total (68 non-conserved miRNAs use NaN for seed_family)"
 )
 
 m1, m2, m3 = st.columns(3)
