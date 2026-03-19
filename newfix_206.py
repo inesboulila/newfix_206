@@ -1,14 +1,3 @@
-"""
-miRNA Upregulation Predictor
-=============================
-Model : lgbm_mirna_model.pkl  (LightGBM + TargetEncoder pipeline)
-Run   : streamlit run app.py
-
-Features expected by the model (in order):
-  CAT: parasite, organism, cell type, seed_family, parasite_celltype
-  NUM: time, is_conserved
-"""
-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -101,14 +90,12 @@ with col_input:
 
     mirna_input = st.text_input(
         "miRNA name",
-        placeholder="e.g. hsa-miR-155-5p, mmu-let-7f",
-        help="Enter the miRBase ID. The seed family is looked up automatically."
+        placeholder="e.g. hsa-miR-155-5p, mmu-let-7f"
     )
 
     parasite = st.selectbox(
         "Parasite species",
-        options=options['parasite'],
-        help="Leishmania species used in the experiment"
+        options=options['parasite']
     )
 
     organism = st.selectbox(
@@ -121,10 +108,13 @@ with col_input:
         options=options['cell_type']
     )
 
-    time = st.selectbox(
+    # Free numeric input — user can type any time point
+    time = st.number_input(
         "Time point (hours post-infection)",
-        options=options['time'],
-        format_func=lambda x: f"{x}h"
+        min_value=0,
+        max_value=10000,
+        value=24,
+        step=1
     )
 
     predict_btn = st.button("Predict", type="primary", use_container_width=True)
@@ -136,7 +126,7 @@ with col_result:
 
     if predict_btn:
         if not mirna_input.strip():
-            st.warning("Please enter a miRNA name.")
+            st.info("Please enter a miRNA name.")
         else:
             # ── Step 1: look up seed family ───────────────────
             family       = lookup_family(mirna_input.strip(), lookup)
@@ -145,7 +135,7 @@ with col_result:
             if family:
                 st.info(f"Seed family found: **{family}**")
             else:
-                st.warning(
+                st.info(
                     f"**{mirna_input}** is not in the broadly conserved "
                     "TargetScan families. Prediction will rely on the other "
                     "features (parasite, organism, cell type, time)."
